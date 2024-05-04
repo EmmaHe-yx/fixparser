@@ -19,8 +19,16 @@ import java.util.Arrays;
 import java.util.Vector;
 
 public class FIXParser {
+    private  static final int loglvl = 3;
+    private void debuglog(int lvl, String message) {
+        if (loglvl >= lvl)
+            System.out.println("__DEBUG: " + message);
+    }
+
     // constants, definitions
     private static final byte DELIMITER = 0x1;
+    private static final byte EQUALSIGN = '=';
+
 
     // helper class
     public static class TagIndicator {
@@ -38,7 +46,7 @@ public class FIXParser {
     /// members
     ////////////////////
     byte[] msg;
-    Vector<TagIndicator> vDelimiter = new Vector<TagIndicator>();
+    Vector<TagIndicator> vDelimiter = new Vector<>();
 
     ////////////////////
     // functions
@@ -47,51 +55,93 @@ public class FIXParser {
     {
         msg = bytes;
     }
-    private int findNextOf(byte[] arr, int pos, byte b) {
-        for (int i = pos; i < arr.length; ++i) {
-            if (arr[i] == b)
+
+    public FIXParser(String filename) {
+        try {
+            msg = Files.readAllBytes(Paths.get(filename));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private int findNextOf(int pos, byte b) {
+        for (int i = pos; i < msg.length; ++i) {
+            debuglog(5, "pos:" + i + " char:" + msg[i] + " vs " + b);
+            if (msg[i] == b)
                 return i;
         }
         // TODO -1 or length?
-        return -1;
+        return msg.length;
     }
 
     private boolean tokenizeAndValidate()
     {
-        boolean valid = true;
         byte sum = 0;
-        byte checksum = 0;
-        interface Compare {
-            boolean compare(byte[] b1, int s, int e, byte[] b2);
+        byte checksum;
+        interface BytesCompare {
+            boolean equal(byte[] b1, int s1, byte[] b2);
         }
-        Compare bytesEqual = (a1, s, e, other) -> {
-            return Arrays.compare(a1, s, e, other, 0, other.length) == 0;
+        BytesCompare bc = (a1, s, other) -> {
+            return Arrays.compare(a1, s, s+other.length, other, 0, other.length) == 0;
         };
 
         // parse header
-        int idxHeader = 0;
-        var header = "8=".getBytes();
-        //if (Arrays.compare(msg, 0, 2, header, 0, 2) == 0) {
-        if (bytesEqual.compare(msg, 0, 2, header)) {
+        var tagBegin = "8=".getBytes();
+        if (!bc.equal(msg, 0, tagBegin)) {
+            debuglog(1, "invalid message: wrong header tag");
+            return false;
         }
+
+        int posS = findNextOf(0, DELIMITER);
+        int posM = findNextOf(posS, EQUALSIGN);
+        int posE = findNextOf(posM, DELIMITER);
+
+        byte[] tagLength = "9=".getBytes();
+        if (!bc.equal(msg, posS+1, tagLength)) {
+            debuglog(1, "invalid message: wrong length tag");
+            return false;
+        }
+
+        debuglog(3, "length pos: " + posS + "," + posM + "," + posE);
+
+        int idxMsgStart = posE + 1;
+        int msglength = parseInt(msg, posM + 1, posE);
+        debuglog(2, "msg length: " + msglength);
+
 
         // parse trailer
         int idxTrailer = msg.length - 7; // "10=xxx|"
-        var trailer = "10=".getBytes();
-        if (Arrays.compare(msg, idxTrailer, idxTrailer+3, trailer, 0, 3) == 0) {
-            checksum = (byte) (msg[idxTrailer+3]*100 + msg[idxTrailer+4]*10 + msg[idxTrailer+5]);
-        }
-        else
+        var tagTrailer = "10=".getBytes();
+        if (!bc.equal(msg, idxTrailer, tagTrailer)) {
+            debuglog(1, "invalid message: wrong trailing tag");
             return false;
+        }
+
+        // compare length
+        if (msglength != idxTrailer - idxMsgStart) {
+            debuglog(1, "invalid message: wrong length");
+            return false;
+        }
+
+        checksum = (byte) parseInt(msg, idxTrailer+3, msg.length-1);
 
         // parse body & calculate checksum
         for (int idx = 0; idx < idxTrailer; ++idx) {
             sum += msg[idx];
+            debuglog(5, "idx:" + idx + " value:" + String.format("%02x", msg[idx]) + "/" + msg[idx] + " sum:" + sum);
         }
 
         // find checksum value
-        // TODO compare checksum
+        debuglog(3, "msg checksum:" + checksum + " calculated:" + sum);
         return checksum == sum;
+    }
+
+    // posS: inclusive; posE: exclusive
+    private int parseInt(byte[] msg, int posS, int posE) {
+        int result = 0;
+        for (int i = posS; i < posE; ++i)
+            result = result * 10 + (msg[i]-'0');
+        return result;
     }
 
     private boolean parse()
@@ -124,33 +174,9 @@ public class FIXParser {
     // testing
     ////////////////////
 
-    public void mytest() {
-        {
-            System.out.println("__DEBUG: size of delimiter:" + vDelimiter.size());
-            System.out.println("__DEBUG: elements in delimiter position:");
-            for (Object obj : vDelimiter) {
-                System.out.println("__DEBUG: " + obj);
-            }
-        }
-
-    }
-
-    public void unittest()
-    {
-    }
-
-    public void perftest()
-    {
-    }
-
-    public static void main(String[] args) {
-        byte[] b;
-        try {
-            b = Files.readAllBytes(Paths.get(".\\input.txt"));
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
-        FIXParser fp = new FIXParser(b);
+    public static void mytest() {
+        String filename = "example.txt";
+        FIXParser fp = new FIXParser(filename);
         System.out.println("__DEBUG: message:\n" + fp.getMsg());
 
         boolean valid = fp.tokenizeAndValidate();
@@ -159,9 +185,30 @@ public class FIXParser {
             return;
         }
 
-        fp.mytest();
+        {
+            System.out.println("__DEBUG: size of delimiter:" + fp.vDelimiter.size());
+            System.out.println("__DEBUG: elements in delimiter position:");
+            for (Object obj : fp.vDelimiter) {
+                System.out.println("__DEBUG: " + obj);
+            }
+        }
 
-        fp.unittest();
-        fp.perftest();
+    }
+
+    public static void unittest()
+    {
+    }
+
+    public static void perftest()
+    {
+    }
+
+    public static void main(String[] args) {
+
+
+        mytest();
+
+        unittest();
+        perftest();
     }
 }
