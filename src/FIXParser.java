@@ -4,7 +4,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.charset.UnsupportedCharsetException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Vector;
 
@@ -29,6 +32,8 @@ public class FIXParser {
         MsgType             (35     , Type.STRING                           ),
         NoOrders            (73     , Type.INT      , Property.REPEATED     ),
         OrderID             (37     , Type.INT                              ),
+
+        SendingTime         (52     , Type.DATE                             ),
 
         MessageEncoding     (347    , Type.STRING                           ),
         // text length & text
@@ -316,6 +321,7 @@ public class FIXParser {
         return valid;
     }
 
+    // attempt to directly parse byte by byte, but not maintained with latest change when I found this is slower
     public boolean parseDirect() {
         interface BytesCompare {
             boolean equal(byte[] b1, int s1, byte[] b2);
@@ -466,8 +472,13 @@ public class FIXParser {
     public void print() {
         System.out.println("msg length: " + msg.length + ", number of fields: " + vecFields.size());
         for (var f : vecFields) {
-            if (f.tag != null && f.tag.type == Tag.Type.DATA)
-                System.out.println(f.tagNum + " | binary data of length " + (f.posEnd - f.posValue));
+            if (f.tag != null && f.tag.type == Tag.Type.DATA) {
+                StringBuilder hex = new StringBuilder();
+                for (int i = f.posValue; i < f.posEnd; ++i) {
+                    hex.append(String.format("%02x ", msg[i]));
+                }
+                System.out.println(f.tagNum + " | (bytes in hex) " + hex);
+            }
             else if (f.tag != null && f.tag.property == Tag.Property.ENCODED)
                 System.out.println(f.tagNum + " | " + new String(msg, f.posValue, f.posEnd-f.posValue, encoding));
             else
@@ -529,7 +540,34 @@ public class FIXParser {
         else if (fi.tag.type != Tag.Type.STRING)
             throw new RuntimeException("tag type not match");
 
-        return extractString(fi.posValue, fi.posEnd);
+        if (fi.tag.property == Tag.Property.ENCODED)
+            return extractString(fi.posValue, fi.posEnd, encoding);
+        else
+            return extractString(fi.posValue, fi.posEnd);
+    }
+
+    public Date getTagValueDate(int tagNum) {
+        var fi = mapFields.get(tagNum);
+        if (fi == null)
+            throw new RuntimeException("tag not exist");
+        else if (fi.tag.type != Tag.Type.DATE)
+            throw new RuntimeException("tag type not match");
+
+        String fmt1 = "yyyyMMdd-HH:mm:ss";
+        String fmt2 = "yyyyMMdd-HH:mm:ss.SSS";
+        SimpleDateFormat sdf;
+        if (fi.posEnd - fi.posValue == fmt1.length()) {
+            sdf = new SimpleDateFormat(fmt1);
+        }
+        else {
+            sdf = new SimpleDateFormat(fmt2);
+        }
+
+        try {
+            return sdf.parse(extractString(fi.posValue, fi.posEnd));
+        } catch (ParseException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     ////////////////////
@@ -537,6 +575,7 @@ public class FIXParser {
     ////////////////////
     public static void parseFile(String filename)
     {
+        System.out.println("-------- " + filename + " --------");
         FIXParser fp = new FIXParser(filename);
         try {
             fp.parse();
@@ -610,15 +649,36 @@ public class FIXParser {
 
     public static void unittest()
     {
+        // basic functions
+        {
+            byte[] msg = "abcde\001defghi\001\00112233\001\002\003".getBytes();
+            FIXParser fp = new FIXParser(msg);
+            int[] pInt = fp.extractPositiveIntWithPos(14, CHAR_SOH);
+            assertEqual(12233, pInt[0], "case 1: basics extractPositiveIntWithPos value");
+            assertEqual(19, pInt[1], "case 1: basics extractPositiveIntWithPos end pos");
+            assertEqual(5, fp.findNextOf(0, CHAR_SOH), "case 1: basics finxNextOf");
+            assertEqual(12233, fp.extractInt(14, 19), "case 1: basics extractInt");
+            assertEqual("abcde", fp.extractString(0, 5), "case 1: basics extractString");
+        }
+
+
         // execution message
         {
             byte[] msg = "8=FIX.4.4\0019=289\00135=8\00134=1090\00149=TESTSELL1\00152=20180920-18:23:53.671\00156=TESTBUY1\0016=113.35\00111=636730640278898634\00114=3500.0000000000\00115=USD\00117=20636730646335310000\00121=2\00131=113.35\00132=3500\00137=20636730646335310000\00138=7000\00139=1\00140=1\00154=1\00155=MSFT\00160=20180920-18:23:53.531\001150=F\001151=3500\001453=1\001448=BRK2\001447=D\001452=1\00110=151\001".getBytes();
             FIXParser fp = new FIXParser(msg);
             fp.parse();
-            assertEqual("FIX.4.4", fp.getTagValueString(8), "case 1: begin string");
-            assertEqual("8", fp.getTagValueString(35), "case 1: message type");
-            assertEqual(113.35, fp.getTagValueDouble(6), "case 1: AvgPx");
-            assertEqual(3500, fp.getTagValueDouble(14), "case 1: CumQty");
+
+            Date d = fp.getTagValueDate(52);
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd-HH:mm:ss.SSS");
+            String strDate = sdf.format(d);
+
+            assertEqual(29, fp.vecFields.size(), "case 2: parsed size");
+            assertEqual("FIX.4.4", fp.getTagValueString(8), "case 2: BeginString");
+            assertEqual("8", fp.getTagValueString(35), "case 2: MsgType");
+            assertEqual(289, fp.getTagValueInt(9), "case 2: BodyLength");
+            assertEqual(113.35, fp.getTagValueDouble(6), "case 2: AvgPx");
+            assertEqual(3500, fp.getTagValueDouble(14), "case 2: CumQty");
+            assertEqual("20180920-18:23:53.671", strDate, "case 2: UTCTimestamp");
         }
 
         // multiple binary data
@@ -626,19 +686,19 @@ public class FIXParser {
             byte[] msg = "8=FIX.4.2\0019=56\00135=A\00134=978\00195=12\00196=1\001\002\0010=1\00190=1\00190=12\00191=0=1\001\002\0019=1\001\0021\00110=203\001".getBytes();
             FIXParser fp = new FIXParser(msg);
             fp.parse();
-            assertEqual(9, fp.vecFields.size(), "case 2: parsed size");
-            assertEqual(20, fp.vecFields.get(3).posTag, "case 2: start of tag message type");
-            assertEqual(23, fp.vecFields.get(3).posValue, "case 2: start of value of tag message type");
-            assertEqual(26, fp.vecFields.get(3).posEnd, "case 2: end of value of tag message type");
-            assertEqual(96, fp.mapFields.get(96).tagNum, "case 2: value of tag raw data");
-            assertEqual(96, fp.mapFields.get(96).tag.key, "case 2: tag key of tag raw data");
-            assertEqual(33, fp.mapFields.get(96).posTag, "case 2: start of tag raw data");
-            assertEqual(36, fp.mapFields.get(96).posValue, "case 2: start of value of tag raw data");
-            assertEqual(48, fp.mapFields.get(96).posEnd, "case 2: end of value of tag raw data");
+            assertEqual(9, fp.vecFields.size(), "case 3: parsed size");
+            assertEqual(20, fp.vecFields.get(3).posTag, "case 3: start of tag message type");
+            assertEqual(23, fp.vecFields.get(3).posValue, "case 3: start of value of tag message type");
+            assertEqual(26, fp.vecFields.get(3).posEnd, "case 3: end of value of tag message type");
+            assertEqual(96, fp.mapFields.get(96).tagNum, "case 3: value of tag raw data");
+            assertEqual(96, fp.mapFields.get(96).tag.key, "case 3: tag key of tag raw data");
+            assertEqual(33, fp.mapFields.get(96).posTag, "case 3: start of tag raw data");
+            assertEqual(36, fp.mapFields.get(96).posValue, "case 3: start of value of tag raw data");
+            assertEqual(48, fp.mapFields.get(96).posEnd, "case 3: end of value of tag raw data");
         }
     }
 
-    public static void perftest()
+    public static void perftest(String filename)
     {
         byte[] msg = "8=FIX.4.2\0019=180\00135=A\00134=978\00195=12\00196=1\001\002\0010=1\00190=1\00190=12\00191=0=1\001\002\0019=1\001\0021\001552=2\00154=1\001453=2\001448=Party1\001447=D\001452=11\001448=Party2\001447=D\001452=56\00154=2\001453=2\001448=Party3\001447=D\001452=11\001448=Party4\001447=D\001452=56\00110=210\001".getBytes();
         long startTime;
@@ -646,7 +706,13 @@ public class FIXParser {
         long duration;
 
         startTime = System.nanoTime();
-        FIXParser fp = new FIXParser(msg);
+        FIXParser fp;
+        if (filename == null)
+            fp = new FIXParser(msg);
+        else
+            fp = new FIXParser(filename);
+
+        System.out.println("msg:" + fp.getMsgString());
         for (int i = 0; i < 20000; ++i)
         {
             fp.parse();
@@ -678,7 +744,11 @@ public class FIXParser {
             unittest();
         }
         else if (args[0].equals("perftest")) {
-            perftest();
+            String filename;
+            if (args.length > 1)
+                perftest(args[1]);
+            else
+                perftest(null);
         }
         else {
             for (var arg : args)
